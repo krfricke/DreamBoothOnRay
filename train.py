@@ -8,6 +8,7 @@ from ray.air import session, ScalingConfig
 from ray.train.torch import TorchTrainer
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grad_norm_
 from transformers import CLIPTextModel
 
@@ -53,6 +54,8 @@ def load_models(args, cuda):
     )
     text_encoder.to(cuda[1])
     text_encoder.train()
+    text_encoder = DistributedDataParallel(text_encoder, device_ids=[cuda[1]],
+                                           output_device=cuda[1])
 
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.model_dir, subfolder="scheduler", torch_dtype=dtype,
@@ -74,17 +77,19 @@ def load_models(args, cuda):
         unet.enable_xformers_memory_efficient_attention()
     # UNET is the largest component, occupying first GPU by itself.
     unet.to(cuda[0])
+    unet = DistributedDataParallel(unet, device_ids=[cuda[0]], output_device=cuda[0])
     unet.train()
 
     torch.cuda.empty_cache()
-    
+
     return text_encoder, noise_scheduler, vae, unet
 
 
 def get_cuda_devices():
     devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    local_rank = session.get_local_rank()
     assert len(devices) >= 2, "Require at least 2 GPU devices to work."
-    return devices
+    return devices[(local_rank * 2):((local_rank * 2) + 2)]
 
 
 def train_fn(args):
@@ -104,7 +109,6 @@ def train_fn(args):
     # Train!
     num_update_steps_per_epoch = train_dataset.count()
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-    total_batch_size = args.train_batch_size
 
     print(f"Running {num_train_epochs} epochs. Max training steps {args.max_train_steps}.")
 
@@ -115,7 +119,7 @@ def train_fn(args):
         ):
             # Load batch on GPU 2 because VAE and text encoder are there.
             batch = collate(batch, cuda[1], torch.bfloat16)
- 
+
             optimizer.zero_grad()
 
             # Convert images to latent space
@@ -162,14 +166,14 @@ def train_fn(args):
             }
             session.report(results)
 
-            if global_step >= args.max_train_steps:
+            if global_step >= (args.max_train_steps / session.get_world_size()):
                 break
 
     # Create pipeline using the trained modules and save it.
     pipeline = DiffusionPipeline.from_pretrained(
         args.model_dir,
-        text_encoder=text_encoder,
-        unet=unet,
+        text_encoder=text_encoder.module,
+        unet=unet.module,
     )
     pipeline.save_pretrained(args.output_dir)
 
@@ -188,7 +192,7 @@ if __name__ == "__main__":
         train_loop_config=args,
         scaling_config=ScalingConfig(
             use_gpu=True,
-            num_workers=1,
+            num_workers=4,
             resources_per_worker={
                 "GPU": 2,
             }
