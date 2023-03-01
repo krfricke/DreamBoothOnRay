@@ -34,12 +34,12 @@ Prepare some directories and environment variables.
 ```bash
 export ORIG_MODEL_NAME="models--CompVis--stable-diffusion-v1-4"
 export ORIG_MODEL_HASH="3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4"
-export ORIG_MODEL_DIR="./model-orig"
+export ORIG_MODEL_DIR="/tmp/model-orig"
 export ORIG_MODEL_PATH="$ORIG_MODEL_DIR/$ORIG_MODEL_NAME/snapshots/$ORIG_MODEL_HASH"
-export TUNED_MODEL_DIR="./model-tuned"
-export IMAGES_REG_DIR="./images-reg"
-export IMAGES_OWN_DIR="./images-own"
-export IMAGES_NEW_DIR="./images-new"
+export TUNED_MODEL_DIR="/tmp/model-tuned"
+export IMAGES_REG_DIR="/tmp/images-reg"
+export IMAGES_OWN_DIR="/tmp/images-own"
+export IMAGES_NEW_DIR="/tmp/images-new"
 
 export CLASS_NAME="cat"
 
