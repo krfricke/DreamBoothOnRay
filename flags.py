@@ -71,10 +71,10 @@ def train_arguments():
         help="Train learning rate."
     )
     parser.add_argument(
-        "--max_train_steps",
+        "--num_epochs",
         type=int,
-        default=800,
-        help="Maximum number of training steps."
+        default=4,
+        help="Number of epochs to train."
     )
     parser.add_argument(
         "--prior_loss_weight",

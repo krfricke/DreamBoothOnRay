@@ -2,7 +2,12 @@ import itertools
 import math
 from os import path
 
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    DiffusionPipeline,
+    UNet2DConditionModel,
+)
 from diffusers.utils.import_utils import is_xformers_available
 from ray.air import session, ScalingConfig
 from ray.train.torch import TorchTrainer
@@ -25,15 +30,16 @@ def prior_preserving_loss(model_pred, target, weight):
     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
     # Compute prior loss
-    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+    prior_loss = F.mse_loss(
+        model_pred_prior.float(), target_prior.float(), reduction="mean"
+    )
 
     # Add the prior loss to the instance loss.
     return loss + weight * prior_loss
 
 
 def get_target(scheduler, noise):
-    """Get the target for loss depending on the prediction type.
-    """
+    """Get the target for loss depending on the prediction type."""
     pred_type = scheduler.config.prediction_type
     if pred_type == "epsilon":
         return noise
@@ -42,28 +48,31 @@ def get_target(scheduler, noise):
     raise ValueError(f"Unknown prediction type {pred_type}")
 
 
-def load_models(args, cuda):
-    """Load pre-trained Stable Diffusion models.
-    """
+def load_models(config, cuda):
+    """Load pre-trained Stable Diffusion models."""
     # Load all models in bfloat16 to save GRAM.
     # For models that are only used for inferencing, full precision is also not required.
     dtype = torch.bfloat16
 
     text_encoder = CLIPTextModel.from_pretrained(
-        args.model_dir, subfolder="text_encoder", torch_dtype=dtype,
+        args.model_dir,
+        subfolder="text_encoder",
+        torch_dtype=dtype,
     )
     text_encoder.to(cuda[1])
     text_encoder.train()
-    text_encoder = DistributedDataParallel(text_encoder, device_ids=[cuda[1]],
-                                           output_device=cuda[1])
 
     noise_scheduler = DDPMScheduler.from_pretrained(
-        args.model_dir, subfolder="scheduler", torch_dtype=dtype,
+        config["model_dir"],
+        subfolder="scheduler",
+        torch_dtype=dtype,
     )
 
     # VAE is only used for inference, keeping weights in full precision is not required.
     vae = AutoencoderKL.from_pretrained(
-        args.model_dir, subfolder="vae", torch_dtype=dtype,
+        config["model_dir"],
+        subfolder="vae",
+        torch_dtype=dtype,
     )
     # We are not training VAE part of the model.
     vae.requires_grad_(False)
@@ -71,13 +80,14 @@ def load_models(args, cuda):
 
     # Convert unet to bf16 to save GRAM.
     unet = UNet2DConditionModel.from_pretrained(
-        args.model_dir, subfolder="unet", torch_dtype=dtype,
+        config["model_dir"],
+        subfolder="unet",
+        torch_dtype=dtype,
     )
     if is_xformers_available():
         unet.enable_xformers_memory_efficient_attention()
     # UNET is the largest component, occupying first GPU by itself.
     unet.to(cuda[0])
-    unet = DistributedDataParallel(unet, device_ids=[cuda[0]], output_device=cuda[0])
     unet.train()
 
     torch.cuda.empty_cache()
@@ -89,33 +99,38 @@ def get_cuda_devices():
     devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
     local_rank = session.get_local_rank()
     assert len(devices) >= 2, "Require at least 2 GPU devices to work."
-    return devices[(local_rank * 2):((local_rank * 2) + 2)]
+    return devices[(local_rank * 2) : ((local_rank * 2) + 2)]
 
 
-def train_fn(args):
+def train_fn(config):
     cuda = get_cuda_devices()
 
     # Load pre-trained models.
-    text_encoder, noise_scheduler, vae, unet = load_models(args, cuda)
+    text_encoder, noise_scheduler, vae, unet = load_models(config, cuda)
+
+    # Wrap in DDP
+    text_encoder = DistributedDataParallel(
+        text_encoder, device_ids=[cuda[1]], output_device=cuda[1]
+    )
+    unet = DistributedDataParallel(unet, device_ids=[cuda[0]], output_device=cuda[0])
 
     # Use the regular AdamW optimizer to work with bfloat16 weights.
     optimizer = torch.optim.AdamW(
         itertools.chain(text_encoder.parameters(), unet.parameters()),
-        lr=args.lr,
+        lr=config["lr"],
     )
 
     train_dataset = session.get_dataset_shard("train")
 
     # Train!
-    num_update_steps_per_epoch = train_dataset.count()
-    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    num_train_epochs = config["num_epochs"]
 
-    print(f"Running {num_train_epochs} epochs. Max training steps {args.max_train_steps}.")
+    print(f"Running {num_train_epochs} epochs.")
 
     global_step = 0
     for epoch in range(num_train_epochs):
         for step, batch in enumerate(
-            train_dataset.iter_torch_batches(batch_size=args.train_batch_size)
+            train_dataset.iter_torch_batches(batch_size=config["train_batch_size"])
         ):
             # Load batch on GPU 2 because VAE and text encoder are there.
             batch = collate(batch, cuda[1], torch.bfloat16)
@@ -130,7 +145,10 @@ def train_fn(args):
             bsz = latents.shape[0]
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=latents.device,
             )
             timesteps = timesteps.long()
 
@@ -143,18 +161,22 @@ def train_fn(args):
 
             # Predict the noise residual. We need to move all data bits to GPU 1.
             model_pred = unet(
-                noisy_latents.to(cuda[0]), timesteps.to(cuda[0]), encoder_hidden_states.to(cuda[0])
+                noisy_latents.to(cuda[0]),
+                timesteps.to(cuda[0]),
+                encoder_hidden_states.to(cuda[0]),
             ).sample
             target = get_target(noise_scheduler, noise).to(cuda[0])
 
             # Now, move model prediction to GPU 2 for loss calculation.
-            loss = prior_preserving_loss(model_pred, target, args.prior_loss_weight)
+            loss = prior_preserving_loss(
+                model_pred, target, config["prior_loss_weight"]
+            )
             loss.backward()
 
             # Gradient clipping before optimizer stepping.
             clip_grad_norm_(
                 itertools.chain(text_encoder.parameters(), unet.parameters()),
-                args.max_grad_norm
+                config["max_grad_norm"],
             )
 
             optimizer.step()  # Step all optimizers.
@@ -165,9 +187,6 @@ def train_fn(args):
                 "loss": loss.detach().item(),
             }
             session.report(results)
-
-            if global_step >= (args.max_train_steps / session.get_world_size()):
-                break
 
     # Create pipeline using the trained modules and save it.
     pipeline = DiffusionPipeline.from_pretrained(
@@ -189,13 +208,13 @@ if __name__ == "__main__":
     # Train with Ray AIR TorchTrainer.
     trainer = TorchTrainer(
         train_fn,
-        train_loop_config=args,
+        train_loop_config=vars(args),
         scaling_config=ScalingConfig(
             use_gpu=True,
-            num_workers=4,
+            num_workers=2,
             resources_per_worker={
                 "GPU": 2,
-            }
+            },
         ),
         datasets={
             "train": train_dataset,
