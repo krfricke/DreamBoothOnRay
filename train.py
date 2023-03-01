@@ -190,11 +190,11 @@ def train_fn(config):
 
     # Create pipeline using the trained modules and save it.
     pipeline = DiffusionPipeline.from_pretrained(
-        args.model_dir,
+        config["model_dir"],
         text_encoder=text_encoder.module,
         unet=unet.module,
     )
-    pipeline.save_pretrained(args.output_dir)
+    pipeline.save_pretrained(config["output_dir"])
 
 
 if __name__ == "__main__":
