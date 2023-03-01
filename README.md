@@ -87,7 +87,7 @@ to your own model this time!
 
 ```
 python run_model.py \
-  --model_dir=$TUNED_MODEL_PATH \
+  --model_dir=$TUNED_MODEL_DIR \
   --output_dir=$IMAGES_NEW_DIR \
   --prompts="photo of a unqtkn $CLASS_NAME on the moon" \
   --num_samples_per_prompt=20
